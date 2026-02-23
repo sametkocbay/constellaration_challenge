@@ -1,0 +1,4 @@
+--- GP for 'edge_rotational_transform_over_n_field_periods' ---
+  Trained in 2809.5s | R² train=1.0000  val=0.9872 | RMSE val=0.0197 | kernel: 0.615**2 * Matern(length_scale=[4.05, 2.53, 2.22, 2.12, 3.37, 2.74, 1.72, 7.87, 1.92, 3.04, 5.3, 22.3, 10.7, 6.51, 33.3, 15.1, 19.5, 6.16, 20.3, 24.7, 8.52, 1e+03, 1e+03, 1e+03, 1e+03, 446, 1e+03, 164, 146, 41.3], nu=2.5) + WhiteKernel(noise_level=1e-05)
+--- GP for 'max_elongation' ---
+  Trained in 2307.6s | R² train=1.0000  val=0.9303 | RMSE val=0.3742 | kernel: 0.908**2 * Matern(length_scale=[3.55, 1.36, 4.49, 1.69, 1.85, 2.54, 1.82, 2.23, 1.39, 1.87, 3.13, 8.28, 6.05, 7.2, 8.34, 6.03, 13, 20.7, 17, 222, 7.77, 20.3, 1e+03, 12.3, 12.2, 16.2, 22.9, 32.5, 41.2, 15.7], nu=2.5) + WhiteKernel(noise_level=1e-05)
