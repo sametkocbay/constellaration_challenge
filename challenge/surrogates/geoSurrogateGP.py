@@ -30,13 +30,16 @@ API (drop-in compatible with geoSurrogate):
 
 from __future__ import annotations
 
+import os
 import pickle
 import random
+import time as _time
 from pathlib import Path
 from typing import Any, Sequence, cast
 
 import numpy as np
 from datasets import load_dataset
+from joblib import Parallel, delayed
 from sklearn.decomposition import PCA
 from sklearn.gaussian_process import GaussianProcessRegressor
 from sklearn.gaussian_process.kernels import (
@@ -46,6 +49,16 @@ from sklearn.gaussian_process.kernels import (
     WhiteKernel,
 )
 from sklearn.preprocessing import StandardScaler
+from tqdm import tqdm
+
+# =========================================================================
+# PARALLELISM — BLAS threading for Cholesky / linear algebra
+# =========================================================================
+_N_CPUS = os.cpu_count() or 1
+for _env_var in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS"):
+    os.environ.setdefault(_env_var, str(_N_CPUS))
+print(f"[geoSurrogateGP] BLAS threads = {os.environ.get('OMP_NUM_THREADS', '?')} "
+      f"({_N_CPUS} CPUs detected)")
 
 # =========================================================================
 # CONFIGURATION
@@ -75,8 +88,10 @@ VAL_SPLIT = 0.15
 N_PCA_COMPONENTS = 30           # reduce from ~100 raw features to 30 PCA dims
 N_AUGMENTED_COPIES = 3          # data augmentation: random perturbations
 AUGMENT_NOISE_STD = 0.005       # small noise to teach local gradients
-MAX_TRAIN_SAMPLES = 5_00      # cap to keep GP tractable (O(n^3), ~50 MB kernel matrix)
+MAX_TRAIN_SAMPLES = 2_000       # cap to keep GP tractable (O(n^3), ~32 MB kernel matrix)
 RANDOM_STATE = 42
+N_RESTARTS_OPTIMIZER = 10       # parallel kernel-hyperparam restarts (uses joblib internally)
+N_RESTARTS_ACQ = 3              # fewer restarts for lightweight acquisition GPs
 
 # Active learning config
 AL_SEED_SIZE = 100              # initial random seed set
@@ -159,7 +174,7 @@ def prepare_data(filter_n_field_periods: int = 3):
     Y: list[list[float]] = []
     skipped = 0
 
-    for row_raw in ds:
+    for row_raw in tqdm(ds, desc="Processing rows", unit="row"):
         row = cast(dict[str, Any], row_raw)
         targets = [row.get(m) for m in TARGET_METRICS]
         if any(t is None for t in targets):
@@ -256,6 +271,75 @@ def _augment_data(
 
 
 # =========================================================================
+# PARALLEL GP FITTING HELPER
+# =========================================================================
+def _fit_single_gp(
+    col_idx: int,
+    metric_name: str,
+    X_train_scaled: np.ndarray,
+    Y_train_scaled_col: np.ndarray,
+    X_val_scaled: np.ndarray,
+    Y_val_col: np.ndarray,
+    y_scaler: StandardScaler,
+    n_components: int,
+    n_restarts: int = N_RESTARTS_OPTIMIZER,
+) -> tuple[GaussianProcessRegressor, str]:
+    """Fit a single GP regressor.  Designed to run in parallel via joblib."""
+    short_name = metric_name.split(".")[-1]
+    print(f"\n--- Training GP for '{short_name}' ---")
+
+    kernel = (
+        ConstantKernel(1.0, constant_value_bounds=(1e-3, 1e3))
+        * Matern(
+            length_scale=np.ones(n_components),
+            length_scale_bounds=(1e-3, 1e3),
+            nu=2.5,
+        )
+        + WhiteKernel(noise_level=1e-2, noise_level_bounds=(1e-5, 1e1))
+    )
+
+    mem_mb = (len(X_train_scaled) ** 2 * 8) / 1e6
+    print(f"  Kernel matrix: {len(X_train_scaled)}x{len(X_train_scaled)} "
+          f"= {mem_mb:.0f} MB")
+
+    gp = GaussianProcessRegressor(
+        kernel=kernel,
+        n_restarts_optimizer=n_restarts,
+        normalize_y=False,
+        alpha=1e-6,
+        random_state=RANDOM_STATE + col_idx,
+    )
+
+    print(f"  Fitting GP ({n_restarts} restarts, {len(X_train_scaled)} samples, "
+          f"{n_components} dims)...")
+    t0 = _time.time()
+    gp.fit(X_train_scaled, Y_train_scaled_col)
+    dt = _time.time() - t0
+    print(f"  ✓ GP fit complete in {dt:.1f}s")
+
+    r2_train = gp.score(X_train_scaled, Y_train_scaled_col)
+    r2_val = gp.score(
+        X_val_scaled,
+        y_scaler.transform(Y_val_col.reshape(-1, 1)).ravel(),
+    )
+
+    y_pred_val_scaled = gp.predict(X_val_scaled)
+    y_pred_val = y_scaler.inverse_transform(
+        np.asarray(y_pred_val_scaled).reshape(-1, 1)
+    ).ravel()
+    rmse_val = np.sqrt(np.mean((y_pred_val - Y_val_col) ** 2))
+
+    msg = (
+        f"  [{short_name}] Trained in {dt:.1f}s | "
+        f"R² train={r2_train:.4f}  val={r2_val:.4f} | "
+        f"RMSE val={rmse_val:.4f} | "
+        f"kernel: {gp.kernel_}"
+    )
+    print(msg)
+    return gp, msg
+
+
+# =========================================================================
 # TRAINING
 # =========================================================================
 def train() -> None:
@@ -318,64 +402,24 @@ def train() -> None:
         Y_val_scaled_list.append(ys.transform(Y_val[:, col : col + 1]).ravel())
         y_scalers.append(ys)
 
-    # ---- fit one GP per output ----
-    gp_models: list[GaussianProcessRegressor] = []
-    log_lines: list[str] = []
-
-    for i, metric_name in enumerate(TARGET_METRICS):
-        short_name = metric_name.split(".")[-1]
-        print(f"\n--- Training GP for '{short_name}' ---")
-        log_lines.append(f"--- GP for '{short_name}' ---\n")
-
-        kernel = (
-            ConstantKernel(1.0, constant_value_bounds=(1e-3, 1e3))
-            * Matern(
-                length_scale=np.ones(n_components),
-                length_scale_bounds=(1e-3, 1e3),
-                nu=2.5,
-            )
-            + WhiteKernel(noise_level=1e-2, noise_level_bounds=(1e-5, 1e1))
+    # ---- fit GPs in parallel (one per output metric) ----
+    print(f"\n=== Fitting {len(TARGET_METRICS)} GPs in parallel ===")
+    results = Parallel(n_jobs=min(len(TARGET_METRICS), _N_CPUS), prefer="threads")(
+        delayed(_fit_single_gp)(
+            i,
+            metric_name,
+            X_train_scaled,
+            Y_train_scaled_list[i],
+            X_val_scaled,
+            Y_val[:, i],
+            y_scalers[i],
+            n_components,
         )
+        for i, metric_name in enumerate(TARGET_METRICS)
+    )
 
-        # Memory estimate: n^2 * 8 bytes for kernel matrix
-        mem_mb = (len(X_train_scaled) ** 2 * 8) / 1e6
-        print(f"  Kernel matrix: {len(X_train_scaled)}×{len(X_train_scaled)} = {mem_mb:.0f} MB")
-
-        gp = GaussianProcessRegressor(
-            kernel=kernel,
-            n_restarts_optimizer=2,   # fewer restarts to save memory (was 5)
-            normalize_y=False,       # already scaled
-            alpha=1e-6,              # jitter for numerical stability
-            random_state=RANDOM_STATE + i,
-        )
-
-        import time as _time
-
-        t0 = _time.time()
-        gp.fit(X_train_scaled, Y_train_scaled_list[i])
-        dt = _time.time() - t0
-
-        # Validation R²
-        r2_train = gp.score(X_train_scaled, Y_train_scaled_list[i])
-        r2_val = gp.score(X_val_scaled, Y_val_scaled_list[i])
-
-        # Validation RMSE (in original scale)
-        y_pred_val_scaled = gp.predict(X_val_scaled)  # type: ignore[assignment]
-        y_pred_val = y_scalers[i].inverse_transform(
-            np.asarray(y_pred_val_scaled).reshape(-1, 1)
-        ).ravel()
-        rmse_val = np.sqrt(np.mean((y_pred_val - Y_val[:, i]) ** 2))
-
-        msg = (
-            f"  Trained in {dt:.1f}s | "
-            f"R² train={r2_train:.4f}  val={r2_val:.4f} | "
-            f"RMSE val={rmse_val:.4f} | "
-            f"kernel: {gp.kernel_}"
-        )
-        print(msg)
-        log_lines.append(msg + "\n")
-
-        gp_models.append(gp)
+    gp_models = [r[0] for r in results]
+    log_lines = [r[1] + "\n" for r in results]
 
     # ---- persist ----
     artefacts = {
@@ -419,8 +463,6 @@ def train_active_learning() -> None:
     space (e.g., low aspect ratio rotating ellipses) where the optimizer
     actually searches, rather than wasting capacity on dense clusters.
     """
-    import time as _time
-
     X_raw_np, X_full_np, Y_np, scaling_info = prepare_data(filter_n_field_periods=3)
 
     # ---- train / val split ----
@@ -459,7 +501,8 @@ def train_active_learning() -> None:
     selected_mask[seed_idx] = True
     print(f"  Seed: {selected_mask.sum()} points (farthest-point sampling)")
 
-    for al_round in range(AL_ROUNDS):
+    al_pbar = tqdm(range(AL_ROUNDS), desc="Active Learning", unit="round")
+    for al_round in al_pbar:
         t0 = _time.time()
         train_sel = pool_indices[selected_mask]
         X_train_al = X_pool_pca[train_sel]
@@ -475,24 +518,43 @@ def train_active_learning() -> None:
             Y_train_al[:, 0:1]
         ).ravel()
 
-        # Fit a lightweight GP (fewer restarts, just for acquisition)
-        kernel = (
-            ConstantKernel(1.0, constant_value_bounds=(1e-3, 1e3))
-            * Matern(
-                length_scale=np.ones(n_components),
-                length_scale_bounds=(1e-2, 1e3),
-                nu=2.5,
+        # Fit TWO lightweight acquisition GPs in parallel (iota + elong)
+        # Using both targets for a combined uncertainty score gives better
+        # coverage than just iota alone.
+        y_scaler_elong_al = StandardScaler()
+        Y_train_elong_scaled = y_scaler_elong_al.fit_transform(
+            Y_train_al[:, 1:2]
+        ).ravel()
+
+        def _fit_acq_gp(y_col: np.ndarray, seed_offset: int) -> GaussianProcessRegressor:
+            kernel = (
+                ConstantKernel(1.0, constant_value_bounds=(1e-3, 1e3))
+                * Matern(
+                    length_scale=np.ones(n_components),
+                    length_scale_bounds=(1e-2, 1e3),
+                    nu=2.5,
+                )
+                + WhiteKernel(noise_level=1e-2, noise_level_bounds=(1e-5, 1e1))
             )
-            + WhiteKernel(noise_level=1e-2, noise_level_bounds=(1e-5, 1e1))
+            gp = GaussianProcessRegressor(
+                kernel=kernel,
+                n_restarts_optimizer=N_RESTARTS_ACQ,
+                normalize_y=False,
+                alpha=1e-5,
+                random_state=RANDOM_STATE + al_round + seed_offset,
+            )
+            gp.fit(X_train_scaled, y_col)
+            return gp
+
+        # Fit both acquisition GPs in parallel
+        acq_results = Parallel(n_jobs=2, prefer="threads")(
+            delayed(_fit_acq_gp)(y_col, offset)
+            for y_col, offset in [
+                (Y_train_iota_scaled, 0),
+                (Y_train_elong_scaled, 100),
+            ]
         )
-        gp_acq = GaussianProcessRegressor(
-            kernel=kernel,
-            n_restarts_optimizer=1,   # fast — just for acquisition
-            normalize_y=False,
-            alpha=1e-5,
-            random_state=RANDOM_STATE + al_round,
-        )
-        gp_acq.fit(X_train_scaled, Y_train_iota_scaled)
+        gp_acq_iota, gp_acq_elong = acq_results
 
         # Score uncertainty on unselected pool (subsample for speed)
         remaining_idx = pool_indices[~selected_mask]
@@ -506,7 +568,12 @@ def train_active_learning() -> None:
         X_cand_pca = X_pool_pca[cand_idx]
         X_cand_scaled = x_scaler_al.transform(X_cand_pca)
 
-        _, cand_std = gp_acq.predict(X_cand_scaled, return_std=True)
+        # Combined uncertainty from both GPs (max of normalised stds)
+        _, cand_std_iota = gp_acq_iota.predict(X_cand_scaled, return_std=True)
+        _, cand_std_elong = gp_acq_elong.predict(X_cand_scaled, return_std=True)
+        cand_std = np.maximum(
+            np.asarray(cand_std_iota), np.asarray(cand_std_elong)
+        )
 
         # Select top-K most uncertain
         n_to_add = min(AL_BATCH_SIZE, len(cand_idx))
@@ -517,12 +584,12 @@ def train_active_learning() -> None:
         dt = _time.time() - t0
         n_selected = selected_mask.sum()
 
-        # Quick validation score + RMSE
+        # Quick validation score + RMSE (using the iota GP)
         X_val_scaled = x_scaler_al.transform(X_val_pca)
         Y_val_iota_scaled = y_scaler_al.transform(Y_val[:, 0:1]).ravel()
-        r2_val = gp_acq.score(X_val_scaled, Y_val_iota_scaled)
+        r2_val = gp_acq_iota.score(X_val_scaled, Y_val_iota_scaled)
 
-        y_pred_val_scaled = gp_acq.predict(X_val_scaled)
+        y_pred_val_scaled = gp_acq_iota.predict(X_val_scaled)
         y_pred_val = y_scaler_al.inverse_transform(
             np.asarray(y_pred_val_scaled).reshape(-1, 1)
         ).ravel()
@@ -548,7 +615,14 @@ def train_active_learning() -> None:
             "time_s": dt,
         })
 
-        print(
+        al_pbar.set_postfix({
+            "pts": int(n_selected),
+            "R²": f"{r2_val:.4f}",
+            "RMSE": f"{rmse_val:.4f}",
+            "unc_max": f"{cand_std[top_k_local].max():.4f}",
+            "time": f"{dt:.1f}s",
+        })
+        tqdm.write(
             f"  Round {al_round + 1}/{AL_ROUNDS}: "
             f"{n_selected} points | "
             f"added {n_to_add} (max unc={cand_std[top_k_local].max():.4f}, "
@@ -591,58 +665,24 @@ def train_active_learning() -> None:
         Y_val_scaled_list.append(ys.transform(Y_val[:, col : col + 1]).ravel())
         y_scalers.append(ys)
 
-    # ---- Fit final GPs ----
-    gp_models: list[GaussianProcessRegressor] = []
-    log_lines: list[str] = ["=== Active Learning GP Training ===\n"]
-
-    for i, metric_name in enumerate(TARGET_METRICS):
-        short_name = metric_name.split(".")[-1]
-        print(f"\n--- Training final GP for '{short_name}' ---")
-        log_lines.append(f"--- GP for '{short_name}' ---\n")
-
-        kernel = (
-            ConstantKernel(1.0, constant_value_bounds=(1e-3, 1e3))
-            * Matern(
-                length_scale=np.ones(n_components),
-                length_scale_bounds=(1e-3, 1e3),
-                nu=2.5,
-            )
-            + WhiteKernel(noise_level=1e-2, noise_level_bounds=(1e-5, 1e1))
+    # ---- Fit final GPs in parallel (one per output metric) ----
+    print(f"\n=== Fitting {len(TARGET_METRICS)} final GPs in parallel ===")
+    results = Parallel(n_jobs=min(len(TARGET_METRICS), _N_CPUS), prefer="threads")(
+        delayed(_fit_single_gp)(
+            i,
+            metric_name,
+            X_train_scaled,
+            Y_train_scaled_list[i],
+            X_val_scaled,
+            Y_val[:, i],
+            y_scalers[i],
+            n_components,
         )
+        for i, metric_name in enumerate(TARGET_METRICS)
+    )
 
-        mem_mb = (len(X_train_scaled) ** 2 * 8) / 1e6
-        print(f"  Kernel matrix: {len(X_train_scaled)}×{len(X_train_scaled)} = {mem_mb:.0f} MB")
-
-        gp = GaussianProcessRegressor(
-            kernel=kernel,
-            n_restarts_optimizer=2,
-            normalize_y=False,
-            alpha=1e-6,
-            random_state=RANDOM_STATE + i,
-        )
-
-        t0 = _time.time()
-        gp.fit(X_train_scaled, Y_train_scaled_list[i])
-        dt = _time.time() - t0
-
-        r2_train = gp.score(X_train_scaled, Y_train_scaled_list[i])
-        r2_val = gp.score(X_val_scaled, Y_val_scaled_list[i])
-
-        y_pred_val_scaled = gp.predict(X_val_scaled)
-        y_pred_val = y_scalers[i].inverse_transform(
-            np.asarray(y_pred_val_scaled).reshape(-1, 1)
-        ).ravel()
-        rmse_val = np.sqrt(np.mean((y_pred_val - Y_val[:, i]) ** 2))
-
-        msg = (
-            f"  Trained in {dt:.1f}s | "
-            f"R² train={r2_train:.4f}  val={r2_val:.4f} | "
-            f"RMSE val={rmse_val:.4f} | "
-            f"kernel: {gp.kernel_}"
-        )
-        print(msg)
-        log_lines.append(msg + "\n")
-        gp_models.append(gp)
+    gp_models = [r[0] for r in results]
+    log_lines = ["=== Active Learning GP Training ===\n"] + [r[1] + "\n" for r in results]
 
     # ---- persist ----
     artefacts = {
@@ -877,7 +917,7 @@ def _farthest_point_sampling(
     selected = [rng.randint(n)]
     min_dists = np.full(n, np.inf)
 
-    for _ in range(n_points - 1):
+    for _ in tqdm(range(n_points - 1), desc="Farthest-point sampling", unit="pt"):
         # Update minimum distances to selected set
         last = X[selected[-1]]
         dists_to_last = np.sum((X - last) ** 2, axis=1)
